@@ -10,7 +10,7 @@ from .support import (calc_cj_fee, choose_sweep_orders, choose_orders,
                       select_one_utxo)
 from .jsonrpc import JsonRpcError, JsonRpcConnectionError, JsonRpc
 from .old_mnemonic import mn_decode, mn_encode
-from .taker import Taker, P2EPTaker
+from .taker import Taker
 from .wallet import (Mnemonic, estimate_tx_fee, WalletError, BaseWallet, ImportWalletMixin,
                      BIP39WalletMixin, BIP32Wallet, BIP49Wallet, LegacyWallet,
                      SegwitWallet, SegwitLegacyWallet, FidelityBondMixin,
@@ -53,10 +53,10 @@ from .wallet_utils import (
     wallet_display, get_utxos_enabled_disabled, wallet_gettimelockaddress,
     wallet_change_passphrase)
 from .wallet_service import WalletService
-from .maker import Maker, P2EPMaker
+from .maker import Maker
 from .yieldgenerator import YieldGenerator, YieldGeneratorBasic, ygmain
 from .snicker_receiver import SNICKERError, SNICKERReceiver
-from .payjoin import parse_payjoin_setup, send_payjoin
+from .payjoin import parse_payjoin_setup, send_payjoin, PayjoinServer
 # Set default logging handler to avoid "No handler found" warnings.
 
 try:

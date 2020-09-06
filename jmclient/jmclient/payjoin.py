@@ -1,7 +1,9 @@
 from zope.interface import implementer
 from twisted.internet import reactor
+from twisted.web.http import UNAUTHORIZED, BAD_REQUEST, NOT_FOUND
 from twisted.web.client import (Agent, readBody, ResponseFailed,
                                 BrowserLikePolicyForHTTPS)
+from twisted.web.resource import Resource, ErrorPage
 from twisted.web.iweb import IPolicyForHTTPS
 from twisted.internet.ssl import CertificateOptions
 from twisted.internet.error import ConnectionRefusedError
@@ -12,11 +14,12 @@ from txtorcon.socks import HostUnreachableError
 import urllib.parse as urlparse
 from urllib.parse import urlencode
 import json
+from io import BytesIO
 from pprint import pformat
-from jmbase import BytesProducer
+from jmbase import BytesProducer, bintohex, jmprint
 from .configure import get_log, jm_single
 import jmbitcoin as btc
-from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet
+from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet, estimate_tx_fee
 from .wallet_service import WalletService
 from .taker_utils import direct_send
 from jmclient import RegtestBitcoinCoreInterface
@@ -77,8 +80,8 @@ class JMPayjoinManager(object):
     pj_state = JM_PJ_NONE
 
     def __init__(self, wallet_service, mixdepth, destination,
-                 amount, server, disable_output_substitution=False,
-                 mode="command-line"):
+                 amount, server=None, disable_output_substitution=False,
+                 mode="command-line", user_info_callback=None):
         assert isinstance(wallet_service, WalletService)
         # payjoin is not supported for non-segwit wallets:
         assert isinstance(wallet_service.wallet,
@@ -94,7 +97,12 @@ class JMPayjoinManager(object):
         assert isinstance(amount, int)
         assert amount > 0
         self.amount = amount
-        self.server = server
+        if server is None:
+            self.server = None
+            self.role = "receiver"
+        else:
+            self.role = "sender"
+            self.server = server
         self.disable_output_substitution = disable_output_substitution
         self.pj_state = self.JM_PJ_INIT
         self.payment_tx = None
@@ -113,25 +121,35 @@ class JMPayjoinManager(object):
         # in case of success:
         self.timeout_fallback_dc = None
 
+        # set callback for conveying info to user (takes one string arg):
+        if not user_info_callback:
+            self.user_info_callback = self.default_user_info_callback
+        else:
+            self.user_info_callback = user_info_callback
+
+    def default_user_info_callback(self, msg):
+        """ Info level message print to command line.
+        """
+        jmprint(msg)
+
     def set_payment_tx_and_psbt(self, in_psbt):
         assert isinstance(in_psbt, btc.PartiallySignedTransaction)
         self.initial_psbt = in_psbt
-        # any failure here is a coding error, as it is fully
-        # under our control.
+
         assert self.sanity_check_initial_payment()
         self.pj_state = self.JM_PJ_PAYMENT_CREATED
 
     def sanity_check_initial_payment(self):
-        """ These checks are motivated by the checks specified
-        for the *receiver* in the btcpayserver implementation doc.
-        We want to make sure our payment isn't rejected.
+        """ These checks are those specified
+        for the *receiver* in BIP78.
+        However, for the sender, we want to make sure our
+        payment isn't rejected. So this is not receiver-only.
         We also sanity check that the payment details match
         the initialization of this Manager object.
         """
         # failure to extract tx should throw an error;
         # this PSBT must be finalized and sane.
         self.payment_tx = self.initial_psbt.extract_transaction()
-
         # inputs must all have witness utxo populated
         for inp in self.initial_psbt.inputs:
             if not isinstance(inp.witness_utxo, btc.CTxOut):
@@ -149,10 +167,6 @@ class JMPayjoinManager(object):
             if out.derivation_map:
                 return False
 
-        # TODO we can replicate the mempool check here for
-        # Core versions sufficiently high, also encapsulate
-        # it in bc_interface.
-
         # our logic requires no more than one change output
         # for now:
         found_payment = 0
@@ -162,6 +176,8 @@ class JMPayjoinManager(object):
                btc.CCoinAddress.from_scriptPubKey(
                    out.scriptPubKey) == self.destination:
                 found_payment += 1
+                self.pay_out = out
+                self.pay_out_index = i
             else:
                 # store this for our balance check
                 # for receiver proposal
@@ -348,6 +364,75 @@ class JMPayjoinManager(object):
         else:
             self.pj_state = self.JM_PJ_PAYJOIN_BROADCAST_FAILED
 
+    def select_receiver_utxos(self):
+        # Rceiver chooses own inputs:
+        # See the gist comment here:
+        # https://gist.github.com/AdamISZ/4551b947789d3216bacfcb7af25e029e#gistcomment-2799709
+        # which sets out the decision Bob must make.
+        # In cases where Bob can add any amount, he selects one utxo
+        # to keep it simple.
+        # In cases where he must choose at least X, he selects one utxo
+        # which provides X if possible, otherwise defaults to a normal
+        # selection algorithm.
+        # In those cases where he must choose X but X is unavailable,
+        # he selects all coins, and proceeds anyway with payjoin, since
+        # it has other advantages (CIOH and utxo defrag).
+        # Returns:
+        # list of utxos
+        # or
+        # False if coins cannot be selected
+
+        my_utxos = {}
+        if self.change_out:
+            largest_out = max(self.amount, self.change_out.nValue)
+        else:
+            largest_out = self.amount
+
+        # make a list of the input values:
+        input_utxo_values = [x.utxo.nValue for x in self.initial_psbt.inputs]
+        max_sender_amt = max(input_utxo_values)
+        not_uih2 = False
+        if max_sender_amt < largest_out:
+            # just select one coin.
+            # have some reasonable lower limit but otherwise choose
+            # randomly; note that this is actually a great way of
+            # sweeping dust ...
+            self.user_info_callback("Choosing one coin at random")
+            try:
+                my_utxos = self.wallet_service.select_utxos(
+                    self.mixdepth, jm_single().DUST_THRESHOLD,
+                    select_fn=select_one_utxo)
+            except:
+                return False
+            not_uih2 = True
+        else:
+            # get an approximate required amount assuming 4 inputs, which is
+            # fairly conservative (but guess by necessity).
+            fee_for_select = estimate_tx_fee(len(self.payment_tx.vin) + 4, 2,
+                                             txtype=self.wallet_service.get_txtype())
+            approx_sum = max_sender_amt - self.amount + fee_for_select
+            try:
+                my_utxos = self.wallet_service.select_utxos(self.mixdepth, approx_sum)
+                not_uih2 = True
+            except Exception:
+                # TODO probably not logical to always sweep here.
+                self.user_info_callback("Sweeping all coins in this mixdepth.")
+                my_utxos = self.wallet_service.get_utxos_by_mixdepth()[self.mixdepth]
+                if my_utxos == {}:
+                    return False
+        if not_uih2:
+            self.user_info_callback("The proposed tx does not trigger UIH2, which "
+                           "means it is indistinguishable from a normal "
+                           "payment. This is the ideal case. Continuing..")
+        else:
+            self.user_info_callback("The proposed tx does trigger UIH2, which it makes "
+                           "it somewhat distinguishable from a normal payment,"
+                           " but proceeding with payjoin..")
+
+        my_total_in = sum([va['value'] for va in my_utxos.values()])
+        self.user_info_callback("We selected inputs worth: " + str(my_total_in))
+        return my_utxos
+
     def report(self, jsonified=False, verbose=False):
         """ Returns a dict (optionally jsonified) containing
         the following information (if they are
@@ -401,7 +486,7 @@ def parse_payjoin_setup(bip21_uri, wallet_service, mixdepth, mode="command-line"
     disable_output_substitution = False
     if "pjos" in decoded and decoded["pjos"] == "0":
         disable_output_substitution = True
-    return JMPayjoinManager(wallet_service, mixdepth, destaddr, amount, server,
+    return JMPayjoinManager(wallet_service, mixdepth, destaddr, amount, server=server,
                         disable_output_substitution=disable_output_substitution,
                         mode=mode)
 
@@ -571,11 +656,9 @@ def receive_payjoin_proposal_from_server(response, manager):
     # if the response code is not 200 OK, we must assume payjoin
     # attempt has failed, and revert to standard payment.
     if int(response.code) != 200:
+        log.warn("Receiver returned error code: " + str(response.code))
         fallback_nonpayjoin_broadcast(manager, err=response.phrase)
         return
-    # for debugging; will be removed in future:
-    log.debug("Response headers:")
-    log.debug(pformat(list(response.headers.getAllRawHeaders())))
     # no attempt at chunking or handling incrementally is needed
     # here. The body should be a byte string containing the
     # new PSBT.
@@ -635,3 +718,138 @@ def process_payjoin_proposal_from_server(response_body, manager):
         manager.timeout_fallback_dc.cancel()
     if manager.mode == "command-line" and reactor.running:
         reactor.stop()
+
+""" Receiver-specific code
+"""
+
+class PayjoinServer(Resource):
+    def __init__(self, wallet_service, mixdepth, destination,
+                 amount, mode="command-line"):
+        self.wallet_service = wallet_service
+        self.manager = JMPayjoinManager(self.wallet_service, mixdepth,
+                                        destination, amount, mode=mode)
+        super().__init__()
+
+    isLeaf = True
+
+    def error(self, error_message, error_code=BAD_REQUEST):
+        log.debug("Returning an error page: " + str(
+            error_message) + " " + str(error_code))
+        return ErrorPage(error_code, error_message, error_message)
+
+    def render_GET(self, request):
+        # can be used e.g. to check if an ephemeral HS is up
+        # on Tor Browser:
+        return "<html>Only for testing.</html>".encode("utf-8")
+
+    def render_POST(self, request):
+        """ The sender will use POST to send the initial
+        payment transaction.
+        """
+        log.debug("The server got this POST request: ")
+        # unfortunately the twisted Request object is not
+        # easily serialized:
+        log.debug(request)
+        log.debug(request.method)
+        log.debug(request.uri)
+        log.debug(request.args)
+        log.debug(request.path)
+        log.debug(request.content)
+        proposed_tx = request.content
+        if not isinstance(proposed_tx, BytesIO):
+            return self.error("Invalid data type.")
+        payment_psbt_base64 = proposed_tx.read()
+        try:
+            payment_psbt = btc.PartiallySignedTransaction.from_base64(
+            payment_psbt_base64)
+        except:
+            return self.error("Invalid base64 initial psbt.")
+
+        try:
+            self.manager.set_payment_tx_and_psbt(payment_psbt)
+        except AssertionError:
+            return self.error("Proposed initial PSBT does not pass sanity checks.")
+
+        # while we do not need to defend against probing attacks,
+        # it is still safer to at least verify the validity of the signatures
+        # at this stage, to ensure no misbehaviour with using inputs
+        # that are not signed correctly:
+        res = jm_single().bc_interface.rpc('testmempoolaccept', [[bintohex(
+            self.manager.payment_tx.serialize())]])
+        if not res[0]["allowed"]:
+            return self.error("Proposed transaction was rejected from mempool.")
+
+        receiver_utxos = self.manager.select_receiver_utxos()
+        if not receiver_utxos:
+            # TODO not an error of the client, server just waits
+            # for non-payjoin?
+            return self.error("Could not select coins for payjoin")
+
+        # construct unsigned tx for payjoin-psbt:
+        payjoin_tx_inputs = [(x.prevout.hash[::-1],
+                    x.prevout.n) for x in payment_psbt.unsigned_tx.vin]
+        payjoin_tx_inputs.extend(receiver_utxos.keys())
+        pay_out = {"value": self.manager.pay_out.nValue,
+                   "address": str(btc.CCoinAddress.from_scriptPubKey(
+                       self.manager.pay_out.scriptPubKey))}
+        if self.manager.change_out:
+            change_out = {"value": self.manager.change_out.nValue,
+                          "address": str(btc.CCoinAddress.from_scriptPubKey(
+                              self.manager.change_out.scriptPubKey))}
+
+        # we now know there were one/two outputs and know which is payment.
+        # bump payment output with our input:
+        if change_out:
+            outs = [pay_out, change_out]
+        else:
+            outs = [pay_out]
+        our_inputs_val = sum([v["value"] for _, v in receiver_utxos.items()])
+        pay_out["value"] += our_inputs_val
+        log.debug("We bumped the payment output value by: " + str(our_inputs_val) + " sats.")
+        log.debug("It is now: " + str(pay_out["value"]) + " sats.")
+        unsigned_payjoin_tx = btc.make_shuffled_tx(payjoin_tx_inputs, outs,
+                                    version=payment_psbt.unsigned_tx.nVersion,
+                                    locktime=payment_psbt.unsigned_tx.nLockTime)
+        log.debug("We created this unsigned tx: ")
+        log.debug(btc.human_readable_transaction(unsigned_payjoin_tx))
+        # to create the PSBT we need the spent_outs for each input,
+        # in the right order:
+        spent_outs = []
+        for i, inp in enumerate(unsigned_payjoin_tx.vin):
+            input_found = False
+            for j, inp2 in enumerate(payment_psbt.unsigned_tx.vin):
+                if inp.prevout == inp2.prevout:
+                    spent_outs.append(payment_psbt.inputs[j].utxo)
+                    input_found = True
+                    break
+            if input_found:
+                continue
+            # if we got here this input is ours, we must find
+            # it from our original utxo choice list:
+            for ru in receiver_utxos.keys():
+                if (inp.prevout.hash[::-1], inp.prevout.n) == ru:
+                    spent_outs.append(
+                        self.wallet_service.witness_utxos_to_psbt_utxos(
+                            {ru: receiver_utxos[ru]})[0])
+                    input_found = True
+                    break
+            # there should be no other inputs:
+            assert input_found
+
+        r_payjoin_psbt = self.wallet_service.create_psbt_from_tx(unsigned_payjoin_tx,
+                                                      spent_outs=spent_outs)
+        log.debug("Receiver created payjoin PSBT:\n{}".format(
+            self.wallet_service.human_readable_psbt(r_payjoin_psbt)))
+
+        signresultandpsbt, err = self.wallet_service.sign_psbt(r_payjoin_psbt.serialize(),
+                                                    with_sign_result=True)
+        assert not err, err
+        signresult, receiver_signed_psbt = signresultandpsbt
+        assert signresult.num_inputs_final == len(receiver_utxos)
+        assert not signresult.is_final
+
+        log.debug("Receiver signing successful. Payjoin PSBT is now:\n{}".format(
+            self.wallet_service.human_readable_psbt(receiver_signed_psbt)))
+        content = receiver_signed_psbt.to_base64()
+        request.setHeader(b"content-length", ("%d" % len(content)).encode("ascii"))
+        return content.encode("ascii")
