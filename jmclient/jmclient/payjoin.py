@@ -22,7 +22,7 @@ import jmbitcoin as btc
 from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet, estimate_tx_fee
 from .wallet_service import WalletService
 from .taker_utils import direct_send
-from jmclient import RegtestBitcoinCoreInterface
+from jmclient import RegtestBitcoinCoreInterface, select_one_utxo
 
 """
 For some documentation see:
@@ -33,6 +33,12 @@ For some documentation see:
     https://github.com/bitcoin/bips/blob/master/bip-0079.mediawiki
 """
 log = get_log()
+
+# Recommended sizes for input vsize as per BIP78
+# (stored here since BIP78 specific; could be moved to jmbitcoin)
+INPUT_VSIZE_LEGACY = 148
+INPUT_VSIZE_SEGWIT_LEGACY = 91
+INPUT_VSIZE_SEGWIT_NATIVE = 68
 
 """ This whitelister allows us to accept any cert for a specific
     domain, and is to be used for testing only; the default Agent
@@ -89,6 +95,13 @@ class JMPayjoinManager(object):
         # our payjoin implementation requires PSBT
         assert isinstance(wallet_service.wallet, PSBTWalletMixin)
         self.wallet_service = wallet_service
+        # for convenience define wallet type here:
+        if isinstance(self.wallet_service.wallet, SegwitLegacyWallet):
+            self.wallet_type = "sw-legacy"
+        elif isinstance(self.wallet_service.wallet, SegwitWallet):
+            self.wallet_type = "sw"
+        else:
+            assert False
         # mixdepth from which payment is sourced
         assert isinstance(mixdepth, int)
         self.mixdepth = mixdepth
@@ -133,11 +146,27 @@ class JMPayjoinManager(object):
         jmprint(msg)
 
     def set_payment_tx_and_psbt(self, in_psbt):
-        assert isinstance(in_psbt, btc.PartiallySignedTransaction)
+        assert isinstance(in_psbt, btc.PartiallySignedTransaction), "invalid PSBT input to JMPayjoinManager."
         self.initial_psbt = in_psbt
 
-        assert self.sanity_check_initial_payment()
+        success, msg = self.sanity_check_initial_payment()
+        if not success:
+            log.error(msg)
+            assert False, msg
         self.pj_state = self.JM_PJ_PAYMENT_CREATED
+
+    def get_payment_psbt_feerate(self):
+        return self.initial_psbt.get_fee()/float(
+            self.initial_psbt.extract_transaction().get_virtual_size())
+
+    def get_vsize_for_input(self):
+        if isinstance(self.wallet_service.wallet, SegwitLegacyWallet):
+            vsize = INPUT_VSIZE_SEGWIT_LEGACY
+        elif isinstance(self.wallet_service.wallet, SegwitWallet):
+            vsize = INPUT_VSIZE_SEGWIT_NATIVE
+        else:
+            raise Exception("Payjoin only supported for segwit wallets")
+        return vsize
 
     def sanity_check_initial_payment(self):
         """ These checks are those specified
@@ -146,26 +175,42 @@ class JMPayjoinManager(object):
         payment isn't rejected. So this is not receiver-only.
         We also sanity check that the payment details match
         the initialization of this Manager object.
+        Returns:
+        (False, reason)
+        or
+        (True, None)
         """
+
         # failure to extract tx should throw an error;
         # this PSBT must be finalized and sane.
         self.payment_tx = self.initial_psbt.extract_transaction()
         # inputs must all have witness utxo populated
         for inp in self.initial_psbt.inputs:
             if not isinstance(inp.witness_utxo, btc.CTxOut):
-                return False
+                return (False, "Input utxo was not witness type.")
+            # see third bullet point of:
+            # https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#receivers-original-psbt-checklist
+            #
+            # Check that all inputs have same scriptPubKey type,
+            # and that it is the same as our wallet (for sender
+            # code in JM this is a no-op, for receiver, we can
+            # only support payjoins fitting our wallet type, since
+            # we do not use multi-wallet or output substitution:
+            input_type = self.wallet_service.check_finalized_input_type(inp)
+            if input_type != self.wallet_type:
+                return (False, "an input was not of the same script type.")
 
         # check that there is no xpub or derivation info
         if self.initial_psbt.xpubs:
-            return False
+            return (False, "Unexpected xpubs found in PSBT.")
         for inp in self.initial_psbt.inputs:
             # derivation_map is an OrderedDict, if empty
             # it will be counted as false:
             if inp.derivation_map:
-                return False
+                return (False, "Unexpected derivation found in PSBT.")
         for out in self.initial_psbt.outputs:
             if out.derivation_map:
-                return False
+                return (False, "Unexpected derivation found in PSBT.")
 
         # our logic requires no more than one change output
         # for now:
@@ -184,11 +229,11 @@ class JMPayjoinManager(object):
                 self.change_out = out
                 self.change_out_index = i
         if not found_payment == 1:
-            return False
+            return (False, "The payment output was not found.")
 
-        return True
+        return (True, None)
 
-    def check_receiver_proposal(self, in_pbst, signed_psbt_for_fees):
+    def check_receiver_proposal(self, in_psbt, signed_psbt_for_fees):
         """ This is the most security critical part of the
         business logic of the payjoin. We must check in detail
         that what the server proposes does not unfairly take money
@@ -222,14 +267,14 @@ class JMPayjoinManager(object):
         (False, "reason for failure")
         (True, None)
         """
-        assert isinstance(in_pbst, btc.PartiallySignedTransaction)
+        assert isinstance(in_psbt, btc.PartiallySignedTransaction)
         orig_psbt = self.initial_psbt
         assert isinstance(orig_psbt, btc.PartiallySignedTransaction)
         # 1
         ourins = [(i.prevout.hash, i.prevout.n) for i in orig_psbt.unsigned_tx.vin]
         found = [0] * len(ourins)
         receiver_input_indices = []
-        for i, inp in enumerate(in_pbst.unsigned_tx.vin):
+        for i, inp in enumerate(in_psbt.unsigned_tx.vin):
             for j, inp2 in enumerate(ourins):
                 if (inp.prevout.hash, inp.prevout.n) == inp2:
                     found[j] += 1
@@ -241,7 +286,7 @@ class JMPayjoinManager(object):
         # 2
         if self.disable_output_substitution:
             found_payment = 0
-            for out in in_pbst.unsigned_tx.vout:
+            for out in in_psbt.unsigned_tx.vout:
                 if btc.CCoinAddress.from_scriptPubKey(out.scriptPubKey) == \
                    self.destination and out.nValue >= self.amount:
                     found_payment += 1
@@ -251,26 +296,15 @@ class JMPayjoinManager(object):
         # 3
         for ind in receiver_input_indices:
             # check the input is finalized
-            if not self.wallet_service.is_input_finalized(in_pbst.inputs[ind]):
+            if not self.wallet_service.is_input_finalized(in_psbt.inputs[ind]):
                 return (False, "receiver input is not finalized.")
             # check the utxo field of the input and see if the
             # scriptPubKey is of the right type.
             # TODO this can be genericized to arbitrary wallets in future.
-            spk = in_pbst.inputs[ind].utxo.scriptPubKey
-            if isinstance(self.wallet_service.wallet, SegwitLegacyWallet):
-                try:
-                    btc.P2SHCoinAddress.from_scriptPubKey(spk)
-                except btc.P2SHCoinAddressError:
-                    return (False,
-                            "Receiver input type does not match ours.")
-            elif isinstance(self.wallet_service.wallet, SegwitWallet):
-                try:
-                    btc.P2WPKHCoinAddress.from_scriptPubKey(spk)
-                except btc.P2WPKHCoinAddressError:
-                    return (False,
-                            "Receiver input type does not match ours.")
-            else:
-                assert False
+            input_type = self.wallet_service.check_finalized_input_type(
+                in_psbt.inputs[ind])
+            if input_type != self.wallet_type:
+                return (False, "receiver input does not match our script type.")
         # 4, 5
         # To get the feerate of the psbt proposed, we use the already-signed
         # version (so all witnesses filled in) to calculate its size,
@@ -294,11 +328,11 @@ class JMPayjoinManager(object):
         # 6
         if self.change_out:
             found_change = 0
-            for out in in_pbst.unsigned_tx.vout:
+            for out in in_psbt.unsigned_tx.vout:
                 if out.scriptPubKey == self.change_out.scriptPubKey:
                     found_change += 1
                     actual_contribution = self.change_out.nValue - out.nValue
-                    if actual_contribution > in_pbst.get_fee(
+                    if actual_contribution > in_psbt.get_fee(
                         ) - self.initial_psbt.get_fee():
                         return (False, "Our change output is reduced more"
                                 " than the fee is bumped.")
@@ -312,18 +346,18 @@ class JMPayjoinManager(object):
                 return (False, "Our change output was not found "
                         "exactly once.")
         # 7
-        if in_pbst.xpubs:
+        if in_psbt.xpubs:
             return (False, "Receiver proposal contains xpub information.")
         # 8
         seqno = self.initial_psbt.unsigned_tx.vin[0].nSequence
-        for inp in in_pbst.unsigned_tx.vin:
+        for inp in in_psbt.unsigned_tx.vin:
             if inp.nSequence != seqno:
                 return (False, "all sequence numbers are not the same.")
         # 9
-        if in_pbst.unsigned_tx.nLockTime != \
+        if in_psbt.unsigned_tx.nLockTime != \
            self.initial_psbt.unsigned_tx.nLockTime:
             return (False, "receiver proposal has altered nLockTime.")
-        if in_pbst.unsigned_tx.nVersion != \
+        if in_psbt.unsigned_tx.nVersion != \
            self.initial_psbt.unsigned_tx.nVersion:
             return (False, "receiver proposal has altered nVersion.")
         # all checks passed
@@ -366,69 +400,28 @@ class JMPayjoinManager(object):
 
     def select_receiver_utxos(self):
         # Rceiver chooses own inputs:
-        # See the gist comment here:
+        # For earlier ideas about more complex algorithms, see the gist comment here:
         # https://gist.github.com/AdamISZ/4551b947789d3216bacfcb7af25e029e#gistcomment-2799709
-        # which sets out the decision Bob must make.
-        # In cases where Bob can add any amount, he selects one utxo
-        # to keep it simple.
-        # In cases where he must choose at least X, he selects one utxo
-        # which provides X if possible, otherwise defaults to a normal
-        # selection algorithm.
-        # In those cases where he must choose X but X is unavailable,
-        # he selects all coins, and proceeds anyway with payjoin, since
-        # it has other advantages (CIOH and utxo defrag).
+        # and also see the code in P2EPMaker in earlier versions of Joinmarket.
+        #
+        # For now, it is considered too complex to accurately judge the implications
+        # of the UIH1/2 heuristic violations, in particular because selecting more than
+        # one input has impact on fees which is undesirable and tricky to deal with.
+        # So here we ONLY choose one utxo at random.
+
         # Returns:
-        # list of utxos
+        # list of utxos (currently always of length 1)
         # or
         # False if coins cannot be selected
 
-        my_utxos = {}
-        if self.change_out:
-            largest_out = max(self.amount, self.change_out.nValue)
-        else:
-            largest_out = self.amount
-
-        # make a list of the input values:
-        input_utxo_values = [x.utxo.nValue for x in self.initial_psbt.inputs]
-        max_sender_amt = max(input_utxo_values)
-        not_uih2 = False
-        if max_sender_amt < largest_out:
-            # just select one coin.
-            # have some reasonable lower limit but otherwise choose
-            # randomly; note that this is actually a great way of
-            # sweeping dust ...
-            self.user_info_callback("Choosing one coin at random")
-            try:
-                my_utxos = self.wallet_service.select_utxos(
-                    self.mixdepth, jm_single().DUST_THRESHOLD,
-                    select_fn=select_one_utxo)
-            except:
-                return False
-            not_uih2 = True
-        else:
-            # get an approximate required amount assuming 4 inputs, which is
-            # fairly conservative (but guess by necessity).
-            fee_for_select = estimate_tx_fee(len(self.payment_tx.vin) + 4, 2,
-                                             txtype=self.wallet_service.get_txtype())
-            approx_sum = max_sender_amt - self.amount + fee_for_select
-            try:
-                my_utxos = self.wallet_service.select_utxos(self.mixdepth, approx_sum)
-                not_uih2 = True
-            except Exception:
-                # TODO probably not logical to always sweep here.
-                self.user_info_callback("Sweeping all coins in this mixdepth.")
-                my_utxos = self.wallet_service.get_utxos_by_mixdepth()[self.mixdepth]
-                if my_utxos == {}:
-                    return False
-        if not_uih2:
-            self.user_info_callback("The proposed tx does not trigger UIH2, which "
-                           "means it is indistinguishable from a normal "
-                           "payment. This is the ideal case. Continuing..")
-        else:
-            self.user_info_callback("The proposed tx does trigger UIH2, which it makes "
-                           "it somewhat distinguishable from a normal payment,"
-                           " but proceeding with payjoin..")
-
+        self.user_info_callback("Choosing one coin at random")
+        try:
+            my_utxos = self.wallet_service.select_utxos(
+                self.mixdepth, jm_single().DUST_THRESHOLD,
+                select_fn=select_one_utxo)
+        except Exception as e:
+            log.error("Failed to select coins, exception: " + repr(e))
+            return False
         my_total_in = sum([va['value'] for va in my_utxos.values()])
         self.user_info_callback("We selected inputs worth: " + str(my_total_in))
         return my_utxos
@@ -496,16 +489,12 @@ def get_max_additional_fee_contribution(manager):
     max_additional_fee_contribution = jm_single(
         ).config.get("PAYJOIN", "max_additional_fee_contribution")
     if max_additional_fee_contribution == "default":
-        # calculate the fee bumping allowed according to policy:
-        if isinstance(manager.wallet_service.wallet, SegwitLegacyWallet):
-            vsize = 91
-        elif isinstance(manager.wallet_service.wallet, SegwitWallet):
-            vsize = 68
-        else:
-            raise Exception("Payjoin only supported for segwit wallets")
-        original_fee_rate = manager.initial_psbt.get_fee()/float(
-            manager.initial_psbt.extract_transaction().get_virtual_size())
+        vsize = manager.get_vsize_for_input()
+        original_fee_rate = manager.get_payment_psbt_feerate()
         log.debug("Initial nonpayjoin transaction feerate is: " + str(original_fee_rate))
+        # Factor slightly higher than 1 is to allow some breathing room for
+        # receiver. NB: This may not be appropriate for sender wallets that
+        # use rounded fee rates, but Joinmarket does not.
         max_additional_fee_contribution = int(original_fee_rate * 1.2 * vsize)
         log.debug("From which we calculated a max additional fee "
                   "contribution of: " + str(max_additional_fee_contribution))
@@ -632,7 +621,7 @@ def fallback_nonpayjoin_broadcast(manager, err):
     `err` and will usually be communicated by the server, and must
     be a bytestring.
     Note that the reactor is shutdown after sending the payment (one-shot
-    processing).
+    processing) if this is called on the command line.
     """
     assert isinstance(manager, JMPayjoinManager)
     def quit():
@@ -724,7 +713,8 @@ def process_payjoin_proposal_from_server(response_body, manager):
 
 class PayjoinServer(Resource):
     def __init__(self, wallet_service, mixdepth, destination,
-                 amount, mode="command-line"):
+                 amount, mode="command-line", pj_version = 1):
+        self.pj_version = pj_version
         self.wallet_service = wallet_service
         self.manager = JMPayjoinManager(self.wallet_service, mixdepth,
                                         destination, amount, mode=mode)
@@ -753,9 +743,14 @@ class PayjoinServer(Resource):
         log.debug(request.method)
         log.debug(request.uri)
         log.debug(request.args)
+        sender_parameters = request.args
         log.debug(request.path)
         log.debug(request.content)
         proposed_tx = request.content
+
+        # we only support version 1; reject others:
+        if not self.pj_version == int(sender_parameters[b'v'][0]):
+            return self.error("version-unsupported")
         if not isinstance(proposed_tx, BytesIO):
             return self.error("Invalid data type.")
         payment_psbt_base64 = proposed_tx.read()
@@ -763,12 +758,44 @@ class PayjoinServer(Resource):
             payment_psbt = btc.PartiallySignedTransaction.from_base64(
             payment_psbt_base64)
         except:
-            return self.error("Invalid base64 initial psbt.")
+            return self.error("original-psbt-rejected")
 
         try:
             self.manager.set_payment_tx_and_psbt(payment_psbt)
-        except AssertionError:
+        except Exception:
+            # note that Assert errors, Value errors and CheckTransaction errors
+            # are all possible, so we catch all exceptions to avoid a crash.
             return self.error("Proposed initial PSBT does not pass sanity checks.")
+
+        # if the sender set the additionalfeeoutputindex and maxadditionalfeecontribution
+        # settings, pass them to the PayJoin manager:
+        try:
+            if b"additionalfeeoutputindex" in sender_parameters:
+                afoi = int(sender_parameters[b"additionalfeeoutputindex"][0])
+            else:
+                afoi = None
+            if b"maxadditionalfeecontribution" in sender_parameters:
+                mafc = int(sender_parameters[b"maxadditionalfeecontribution"][0])
+            else:
+                mafc = None
+            if b"minfeerate" in sender_parameters:
+                minfeerate = float(sender_parameters[b"minfeerate"][0])
+            else:
+                minfeerate = None
+        except Exception as e:
+            return self.error("Bad request: error in parsing mafc, afoi data: " + repr(e))
+
+        # if sender chose a fee output it must be the change output,
+        # and the mafc will be applied to that. Any more complex transaction
+        # structure is not supported.
+        # If they did not choose a fee output index, we must rely on the feerate
+        # reduction being not too much, which is checked against minfeerate; if
+        # it is too big a reduction, again we fail payjoin.
+        if (afoi is not None and mafc is None) or (mafc is not None and afoi is None):
+            return self.error("Bad request: bad combination of mafc and afoi.")
+
+        if afoi and not (self.manager.change_out_index == afoi):
+            return self.error("Bad request: change out index does not correspond to afoi.")
 
         # while we do not need to defend against probing attacks,
         # it is still safer to at least verify the validity of the signatures
@@ -805,8 +832,54 @@ class PayjoinServer(Resource):
             outs = [pay_out]
         our_inputs_val = sum([v["value"] for _, v in receiver_utxos.items()])
         pay_out["value"] += our_inputs_val
-        log.debug("We bumped the payment output value by: " + str(our_inputs_val) + " sats.")
+        log.debug("We bumped the payment output value by: " + str(
+            our_inputs_val) + " sats.")
         log.debug("It is now: " + str(pay_out["value"]) + " sats.")
+
+        # if the sender allowed a fee bump, we can apply it to the change output
+        # now (we already checked it's the right index).
+        # A note about checking `minfeerate`: it is impossible for the receiver
+        # to be 100% certain on the size of the final transaction, since he does
+        # not see in advance the (slightly) variable sizes of the sender's final
+        # signatures; hence we do not attempt more than an estimate of the final
+        # signed transaction's size and hence feerate. Very small inaccuracies
+        # (< 1% typically) are possible, therefore.
+        #
+        # First, let's check that the user's requested minfeerate is not higher
+        # than the feerate they already chose:
+        if minfeerate and minfeerate > self.manager.get_payment_psbt_feerate():
+            return self.error("Bad request: minfeerate bigger than original psbt feerate.")
+        # set the intended virtual size of our input:
+        vsize = self.manager.get_vsize_for_input()
+        our_fee_bump = 0
+        if afoi:
+            # We plan to reduce the change_out by a fee contribution.
+            # Calculate the additional fee we think we need for our input,
+            # to keep the same feerate as the original transaction (this also
+            # accounts for rounding as per the BIP).
+            # If it is more than mafc, then bump by mafc, else bump by the
+            # calculated amount.
+            # This should not meaningfully change the feerate.
+            our_fee_bump = int(
+                self.manager.get_payment_psbt_feerate() * vsize)
+            if our_fee_bump > mafc:
+                our_fee_bump = mafc
+
+        elif minfeerate:
+            # In this case the change_out will remain unchanged.
+            # the user has not allowed a fee bump; calculate the new fee
+            # rate; if it is lower than the limit, give up.
+            expected_new_tx_size = self.manager.initial_psbt.extract_transaction(
+                ).get_virtual_size() + vsize
+            expected_new_fee_rate = self.manager.initial_psbt.get_fee()/(
+                expected_new_tx_size + vsize)
+            if expected_new_fee_rate < minfeerate:
+                return self.error("Bad request: we cannot achieve minfeerate requested.")
+
+        # Having checked the sender's conditions, we can apply the fee bump
+        # intended (note the outputs will be shuffled next!):
+        outs[1]["value"] -= our_fee_bump
+
         unsigned_payjoin_tx = btc.make_shuffled_tx(payjoin_tx_inputs, outs,
                                     version=payment_psbt.unsigned_tx.nVersion,
                                     locktime=payment_psbt.unsigned_tx.nLockTime)

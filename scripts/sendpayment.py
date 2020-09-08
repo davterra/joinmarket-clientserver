@@ -11,7 +11,7 @@ import sys
 from twisted.internet import reactor
 import pprint
 
-from jmclient import Taker, P2EPTaker, load_program_config, get_schedule,\
+from jmclient import Taker, load_program_config, get_schedule,\
     JMClientProtocolFactory, start_reactor, validate_address, is_burn_destination, \
     jm_single, estimate_tx_fee, direct_send, WalletService,\
     open_test_wallet_maybe, get_wallet_path, NO_ROUNDING, \

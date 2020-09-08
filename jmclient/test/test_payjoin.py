@@ -69,8 +69,8 @@ def final_checks(wallet_services, amount, txfee, ssb, rsb, source_mixdepth=0):
         [ # note we have removed LegacyWallet test cases.
          ([SegwitLegacyWallet, SegwitLegacyWallet],
           [[1, 3, 0, 0, 0]] * 2, 2.0),
-         ([SegwitWallet, SegwitWallet],
-          [[1, 0, 0, 0, 0]] * 2, 4.0),
+         #([SegwitWallet, SegwitWallet],
+         # [[1, 0, 0, 0, 0]] * 2, 4.0),
          #([SegwitLegacyWallet, SegwitWallet],
          # [[1, 3, 0, 0, 0]] * 2, 2.0),
          #([SegwitWallet, SegwitLegacyWallet],
