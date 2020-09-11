@@ -20,7 +20,7 @@ from .storage import (Argon2Hash, Storage, StorageError, RetryableStorageError,
                       StoragePasswordError, VolatileStorage)
 from .cryptoengine import (BTCEngine, BTC_P2PKH, BTC_P2SH_P2WPKH, EngineError,
                            TYPE_P2PKH, TYPE_P2SH_P2WPKH, TYPE_P2WPKH)
-from .configure import (load_test_config,
+from .configure import (load_test_config, process_shutdown,
     load_program_config, jm_single, get_network, update_persist_config,
     validate_address, is_burn_destination, get_irc_mchannels,
     get_blockchain_interface_instance, set_config, is_segwit_mode,

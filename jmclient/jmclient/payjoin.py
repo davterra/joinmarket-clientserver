@@ -22,7 +22,7 @@ import jmbitcoin as btc
 from .wallet import PSBTWalletMixin, SegwitLegacyWallet, SegwitWallet, estimate_tx_fee
 from .wallet_service import WalletService
 from .taker_utils import direct_send
-from jmclient import RegtestBitcoinCoreInterface, select_one_utxo
+from jmclient import RegtestBitcoinCoreInterface, select_one_utxo, process_shutdown
 
 """
 For some documentation see:
@@ -501,7 +501,7 @@ def get_max_additional_fee_contribution(manager):
     return max_additional_fee_contribution
 
 def send_payjoin(manager, accept_callback=None,
-                 info_callback=None):
+                 info_callback=None, return_deferred=False):
     """ Given a JMPayjoinManager object `manager`, initialised with the
     payment request data from the server, use its wallet_service to construct
     a payment transaction, with coins sourced from mixdepth `mixdepth`,
@@ -603,7 +603,6 @@ def send_payjoin(manager, accept_callback=None,
         Headers({"User-Agent": ["Twisted Web Client Example"],
                 "Content-Type": ["text/plain"]}),
         bodyProducer=body)
-
     d.addCallback(receive_payjoin_proposal_from_server, manager)
     # note that the errback (here "noResponse") is *not* triggered
     # by a server rejection (which is accompanied by a non-200
@@ -613,6 +612,8 @@ def send_payjoin(manager, accept_callback=None,
         log.error(failure.value)
         fallback_nonpayjoin_broadcast(manager, b"connection refused")
     d.addErrback(noResponse)
+    if return_deferred:
+        return d
     return (True, None)
 
 def fallback_nonpayjoin_broadcast(manager, err):
@@ -626,9 +627,7 @@ def fallback_nonpayjoin_broadcast(manager, err):
     assert isinstance(manager, JMPayjoinManager)
     def quit():
         if manager.mode == "command-line" and reactor.running:
-            for dc in reactor.getDelayedCalls():
-                dc.cancel()
-            reactor.stop()
+            process_shutdown()
     log.warn("Payjoin did not succeed, falling back to non-payjoin payment.")
     log.warn("Error message was: " + err.decode("utf-8"))
     original_tx = manager.initial_psbt.extract_transaction()
@@ -638,6 +637,7 @@ def fallback_nonpayjoin_broadcast(manager, err):
         return
     log.info("We paid without coinjoin. Transaction: ")
     log.info(btc.human_readable_transaction(original_tx))
+    manager.set_broadcast(False)
     quit()
 
 def receive_payjoin_proposal_from_server(response, manager):
@@ -705,8 +705,9 @@ def process_payjoin_proposal_from_server(response_body, manager):
         # if transaction is succesfully broadcast, remove the
         # timeout fallback to avoid confusing error messages:
         manager.timeout_fallback_dc.cancel()
+        manager.set_broadcast(True)
     if manager.mode == "command-line" and reactor.running:
-        reactor.stop()
+        process_shutdown()
 
 """ Receiver-specific code
 """

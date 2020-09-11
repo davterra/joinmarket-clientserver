@@ -674,3 +674,13 @@ def is_native_segwit_mode():
     if not is_segwit_mode():
         return False
     return jm_single().config.get('POLICY', 'native') != 'false'
+
+def process_shutdown():
+    from twisted.internet import reactor
+    for dc in reactor.getDelayedCalls():
+        dc.cancel()
+    reactor.stop()
+
+def process_startup():
+    from twisted.internet import reactor
+    reactor.run()

@@ -1,6 +1,6 @@
 
 """
-Test doing payjoin joins (with message channel layer mocked)
+Test doing payjoins over tcp client/server
 """
 
 import os
@@ -8,6 +8,8 @@ import sys
 import pytest
 from twisted.internet import reactor
 from twisted.web.server import Site
+from twisted.trial import unittest
+
 from jmbase import get_log
 from jmbitcoin import (CCoinAddress, encode_bip21_uri,
                        amount_to_btc, amount_to_sat)
@@ -20,6 +22,67 @@ from test_coinjoin import make_wallets_to_list, create_orderbook, sync_wallets
 
 testdir = os.path.dirname(os.path.realpath(__file__))
 log = get_log()
+
+class TrialTestPayjoinServer(unittest.TestCase):
+
+    def setUp(self):
+        load_test_config()
+        jm_single().bc_interface.tick_forward_chain_interval = 5
+        jm_single().bc_interface.simulate_blocks()
+
+    def test_payment(self):
+        wallet_structures = [[1, 3, 0, 0, 0]] * 2
+        mean_amt = 2.0
+        wallet_cls = (SegwitLegacyWallet, SegwitLegacyWallet)
+        self.wallet_services = []
+        self.wallet_services.append(make_wallets_to_list(make_wallets(
+            1, wallet_structures=[wallet_structures[0]],
+            mean_amt=mean_amt, wallet_cls=wallet_cls[0]))[0])
+        self.wallet_services.append(make_wallets_to_list(make_wallets(
+                1, wallet_structures=[wallet_structures[1]],
+                mean_amt=mean_amt, wallet_cls=wallet_cls[1]))[0])
+        jm_single().bc_interface.tickchain()
+        sync_wallets(self.wallet_services)
+
+        # For accounting purposes, record the balances
+        # at the start.
+        self.rsb = getbals(self.wallet_services[0], 0)
+        self.ssb = getbals(self.wallet_services[1], 0)
+
+        self.cj_amount = int(1.1 * 10**8)
+        # destination address is in 2nd mixdepth of receiver
+        # (note: not first because sourcing from first)
+        bip78_receiving_address = self.wallet_services[0].get_internal_addr(1)
+        pjs = PayjoinServer(self.wallet_services[0], 0,
+                      CCoinAddress(bip78_receiving_address), self.cj_amount)
+        site = Site(pjs)
+
+        # NB The connectivity aspects of the BIP78 tests are in
+        # test/payjoin[client/server].py as they are time heavy
+        # and require extra setup. This server is TCP only.
+        self.port = reactor.listenTCP(47083, site)
+        def cbStopListening():
+            return self.port.stopListening()
+        self.addCleanup(cbStopListening)
+
+        # setup of spender
+        bip78_btc_amount = amount_to_btc(amount_to_sat(self.cj_amount))
+        bip78_uri = encode_bip21_uri(bip78_receiving_address,
+                                {"amount": bip78_btc_amount,
+                                 "pj": b"http://127.0.0.1:47083"},
+                                safe=":/")
+        self.manager = parse_payjoin_setup(bip78_uri, self.wallet_services[1], 0)
+        self.manager.mode = "testing"
+        self.site = site
+        return send_payjoin(self.manager, return_deferred=True)
+
+    def tearDown(self):
+        for dc in reactor.getDelayedCalls():
+                    dc.cancel()
+        res = final_checks(self.wallet_services, self.cj_amount,
+                           self.manager.final_psbt.get_fee(),
+                           self.ssb, self.rsb)
+        assert res, "final checks failed"
 
 def getbals(wallet_service, mixdepth):
     """ Retrieves balances for a mixdepth and the 'next'
@@ -63,74 +126,5 @@ def final_checks(wallet_services, amount, txfee, ssb, rsb, source_mixdepth=0):
         print("Taker should have spent: ", txfee + amount,
               " but spent: ", sum(ssb) - sum(spenderbals))
         return False
+    print("Final checks were passed")
     return True
-
-@pytest.mark.parametrize('wallet_cls, wallet_structures, mean_amt',
-        [ # note we have removed LegacyWallet test cases.
-         ([SegwitLegacyWallet, SegwitLegacyWallet],
-          [[1, 3, 0, 0, 0]] * 2, 2.0),
-         #([SegwitWallet, SegwitWallet],
-         # [[1, 0, 0, 0, 0]] * 2, 4.0),
-         #([SegwitLegacyWallet, SegwitWallet],
-         # [[1, 3, 0, 0, 0]] * 2, 2.0),
-         #([SegwitWallet, SegwitLegacyWallet],
-         # [[1, 0, 0, 0, 0]] * 2, 4.0),
-         ])
-def test_simple_payjoin(monkeypatch, tmpdir, setup_cj, wallet_cls,
-                        wallet_structures, mean_amt):
-    def raise_exit(i):
-        raise Exception("sys.exit called")
-    monkeypatch.setattr(sys, 'exit', raise_exit)
-    wallet_services = []
-    wallet_services.append(make_wallets_to_list(make_wallets(
-        1, wallet_structures=[wallet_structures[0]],
-        mean_amt=mean_amt, wallet_cls=wallet_cls[0]))[0])
-    wallet_services.append(make_wallets_to_list(make_wallets(
-            1, wallet_structures=[wallet_structures[1]],
-            mean_amt=mean_amt, wallet_cls=wallet_cls[1]))[0])
-    jm_single().bc_interface.tickchain()
-    sync_wallets(wallet_services)
-
-    # For accounting purposes, record the balances
-    # at the start.
-    rsb = getbals(wallet_services[0], 0)
-    ssb = getbals(wallet_services[1], 0)
-
-    cj_amount = int(1.1 * 10**8)
-    # destination address is in 2nd mixdepth of receiver
-    # (note: not first because sourcing from first)
-    bip78_receiving_address = wallet_services[0].get_internal_addr(1)
-    pjs = PayjoinServer(wallet_services[0], 0,
-                  CCoinAddress(bip78_receiving_address), cj_amount)
-    site = Site(pjs)
-
-    # NB The connectivity aspects of the BIP78 tests are in
-    # test/payjoin[client/server].py as they are time heavy
-    # and require extra setup. This server is TCP only.
-    reactor.listenTCP(47083, site)
-    # setup of spender
-    bip78_btc_amount = amount_to_btc(amount_to_sat(cj_amount))
-    bip78_uri = encode_bip21_uri(bip78_receiving_address,
-                            {"amount": bip78_btc_amount,
-                             "pj": b"http://127.0.0.1:47083"},
-                            safe=":/")
-    manager = parse_payjoin_setup(bip78_uri, wallet_services[1], 0)
-    reactor.callWhenRunning(send_payjoin, manager)
-    reactor.run()
-    # Although the above OK is proof that a transaction went through,
-    # it doesn't prove it was a good transaction! Here do balance checks:
-    assert final_checks(wallet_services, cj_amount,
-                        manager.final_psbt.get_fee(), ssb, rsb)
-
-@pytest.fixture(scope='module')
-def setup_cj():
-    load_test_config()
-    jm_single().config.set('POLICY', 'tx_broadcast', 'self')
-    jm_single().bc_interface.tick_forward_chain_interval = 5
-    jm_single().bc_interface.simulate_blocks()
-    #see note in cryptoengine.py:
-    cryptoengine.BTC_P2WPKH.VBYTE = 100
-    yield None
-    # teardown
-    for dc in reactor.getDelayedCalls():
-        dc.cancel()
