@@ -130,6 +130,10 @@ class JMPayjoinManager(object):
         # processing, shutting down on completion.
         self.mode = mode
 
+        # fix the sequence number if the sender uses only one
+        # (otherwise the receiver is free to do anything):
+        self.fixed_sequence_number = None
+
         # to be able to cancel the timeout fallback broadcast
         # in case of success:
         self.timeout_fallback_dc = None
@@ -230,6 +234,11 @@ class JMPayjoinManager(object):
                 self.change_out_index = i
         if not found_payment == 1:
             return (False, "The payment output was not found.")
+
+        # if the sequence numbers chosen are uniform, record this:
+        seqnums = [x.nSequence for x in self.payment_tx.vin]
+        if seqnums.count(seqnums[0]) == len(seqnums):
+            self.fixed_sequence_number = seqnums[0]
 
         return (True, None)
 
@@ -523,7 +532,7 @@ def send_payjoin(manager, accept_callback=None,
     payment_psbt = direct_send(manager.wallet_service, manager.amount, manager.mixdepth,
                              str(manager.destination), accept_callback=accept_callback,
                              info_callback=info_callback,
-                             with_final_psbt=True)
+                             with_final_psbt=True, optin_rbf=True)
     if not payment_psbt:
         return (False, "could not create non-payjoin payment")
 
@@ -536,8 +545,9 @@ def send_payjoin(manager, accept_callback=None,
     manager.set_payment_tx_and_psbt(payment_psbt)
 
     # add delayed call to broadcast this after 1 minute
-    manager.timeout_fallback_dc = reactor.callLater(60, fallback_nonpayjoin_broadcast,
-                                                    manager, b"timeout")
+    manager.timeout_fallback_dc = reactor.callLater(60,
+                                        fallback_nonpayjoin_broadcast,
+                                        b"timeout", manager)
 
     # Now we send the request to the server, with the encoded
     # payment PSBT
@@ -610,13 +620,13 @@ def send_payjoin(manager, accept_callback=None,
     def noResponse(failure):
         failure.trap(ResponseFailed, ConnectionRefusedError, HostUnreachableError)
         log.error(failure.value)
-        fallback_nonpayjoin_broadcast(manager, b"connection refused")
+        fallback_nonpayjoin_broadcast(b"connection refused", manager)
     d.addErrback(noResponse)
     if return_deferred:
         return d
     return (True, None)
 
-def fallback_nonpayjoin_broadcast(manager, err):
+def fallback_nonpayjoin_broadcast(err, manager):
     """ Sends the non-coinjoin payment onto the network,
     assuming that the payjoin failed. The reason for failure is
     `err` and will usually be communicated by the server, and must
@@ -642,16 +652,16 @@ def fallback_nonpayjoin_broadcast(manager, err):
 
 def receive_payjoin_proposal_from_server(response, manager):
     assert isinstance(manager, JMPayjoinManager)
+    # no attempt at chunking or handling incrementally is needed
+    # here. The body should be a byte string containing the
+    # new PSBT, or a jsonified error page.
+    d = readBody(response)
     # if the response code is not 200 OK, we must assume payjoin
     # attempt has failed, and revert to standard payment.
     if int(response.code) != 200:
         log.warn("Receiver returned error code: " + str(response.code))
-        fallback_nonpayjoin_broadcast(manager, err=response.phrase)
+        d.addCallback(fallback_nonpayjoin_broadcast, manager)
         return
-    # no attempt at chunking or handling incrementally is needed
-    # here. The body should be a byte string containing the
-    # new PSBT.
-    d = readBody(response)
     d.addCallback(process_payjoin_proposal_from_server, manager)
 
 def process_payjoin_proposal_from_server(response_body, manager):
@@ -661,7 +671,7 @@ def process_payjoin_proposal_from_server(response_body, manager):
             btc.PartiallySignedTransaction.from_base64(response_body)
     except Exception as e:
         log.error("Payjoin tx from server could not be parsed: " + repr(e))
-        fallback_nonpayjoin_broadcast(manager, err=b"Server sent invalid psbt")
+        fallback_nonpayjoin_broadcast(b"Server sent invalid psbt", manager)
         return
 
     log.debug("Receiver sent us this PSBT: ")
@@ -723,10 +733,16 @@ class PayjoinServer(Resource):
 
     isLeaf = True
 
-    def error(self, error_message, error_code=BAD_REQUEST):
-        log.debug("Returning an error page: " + str(
-            error_message) + " " + str(error_code))
-        return ErrorPage(error_code, error_message, error_message)
+    def bip78_error(self, request, error_meaning,
+                    error_code="unavailable", http_code=400):
+        # See https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#receivers-well-known-errors
+        # we return stringified json in the body.
+        request.setResponseCode(http_code)
+        request.setHeader(b"content-type", b"text/html; charset=utf-8")
+        log.debug("Returning an error: " + str(
+            error_code) + ": " + str(error_meaning))
+        return json.dumps({"errorCode": error_code,
+                           "message": error_meaning}).encode("utf-8")
 
     def render_GET(self, request):
         # can be used e.g. to check if an ephemeral HS is up
@@ -751,22 +767,29 @@ class PayjoinServer(Resource):
 
         # we only support version 1; reject others:
         if not self.pj_version == int(sender_parameters[b'v'][0]):
-            return self.error("version-unsupported")
+            return self.bip78_error(request,
+                "This version of payjoin is not supported. ",
+                "version-unsupported")
         if not isinstance(proposed_tx, BytesIO):
-            return self.error("Invalid data type.")
+            return self.bip78_error(request, "invalid psbt format",
+                                    "original-psbt-rejected")
         payment_psbt_base64 = proposed_tx.read()
         try:
             payment_psbt = btc.PartiallySignedTransaction.from_base64(
             payment_psbt_base64)
         except:
-            return self.error("original-psbt-rejected")
+            return self.bip78_error(request,
+                                    "invalid psbt format",
+                                    "original-psbt-rejected")
 
         try:
             self.manager.set_payment_tx_and_psbt(payment_psbt)
         except Exception:
             # note that Assert errors, Value errors and CheckTransaction errors
             # are all possible, so we catch all exceptions to avoid a crash.
-            return self.error("Proposed initial PSBT does not pass sanity checks.")
+            return self.bip78_error(request,
+                                    "Proposed initial PSBT does not pass sanity checks.",
+                                    "original-psbt-rejected")
 
         # if the sender set the additionalfeeoutputindex and maxadditionalfeecontribution
         # settings, pass them to the PayJoin manager:
@@ -784,7 +807,8 @@ class PayjoinServer(Resource):
             else:
                 minfeerate = None
         except Exception as e:
-            return self.error("Bad request: error in parsing mafc, afoi data: " + repr(e))
+            return self.bip78_error(request, "Invalid request parameters.",
+                              "original-psbt-rejected")
 
         # if sender chose a fee output it must be the change output,
         # and the mafc will be applied to that. Any more complex transaction
@@ -793,10 +817,14 @@ class PayjoinServer(Resource):
         # reduction being not too much, which is checked against minfeerate; if
         # it is too big a reduction, again we fail payjoin.
         if (afoi is not None and mafc is None) or (mafc is not None and afoi is None):
-            return self.error("Bad request: bad combination of mafc and afoi.")
+            return self.bip78_error(request, "Invalid request parameters.",
+                              "original-psbt-rejected")
 
         if afoi and not (self.manager.change_out_index == afoi):
-            return self.error("Bad request: change out index does not correspond to afoi.")
+            return self.bip78_error(request, "additionalfeeoutputindex is "
+                                    "not the change output. Joinmarket does "
+                                    "not currently support this.",
+                                    "original-psbt-rejected")
 
         # while we do not need to defend against probing attacks,
         # it is still safer to at least verify the validity of the signatures
@@ -805,13 +833,15 @@ class PayjoinServer(Resource):
         res = jm_single().bc_interface.rpc('testmempoolaccept', [[bintohex(
             self.manager.payment_tx.serialize())]])
         if not res[0]["allowed"]:
-            return self.error("Proposed transaction was rejected from mempool.")
+            return self.bip78_error(request, "Proposed transaction was "
+                                    "rejected from mempool.",
+                                    "original-psbt-rejected")
 
         receiver_utxos = self.manager.select_receiver_utxos()
         if not receiver_utxos:
-            # TODO not an error of the client, server just waits
-            # for non-payjoin?
-            return self.error("Could not select coins for payjoin")
+            return self.bip78_error(request,
+                                    "Could not select coins for payjoin",
+                                    "unavailable")
 
         # construct unsigned tx for payjoin-psbt:
         payjoin_tx_inputs = [(x.prevout.hash[::-1],
@@ -849,7 +879,9 @@ class PayjoinServer(Resource):
         # First, let's check that the user's requested minfeerate is not higher
         # than the feerate they already chose:
         if minfeerate and minfeerate > self.manager.get_payment_psbt_feerate():
-            return self.error("Bad request: minfeerate bigger than original psbt feerate.")
+            return self.bip78_error(request, "Bad request: minfeerate "
+                                    "bigger than original psbt feerate.",
+                                    "original-psbt-rejected")
         # set the intended virtual size of our input:
         vsize = self.manager.get_vsize_for_input()
         our_fee_bump = 0
@@ -875,7 +907,9 @@ class PayjoinServer(Resource):
             expected_new_fee_rate = self.manager.initial_psbt.get_fee()/(
                 expected_new_tx_size + vsize)
             if expected_new_fee_rate < minfeerate:
-                return self.error("Bad request: we cannot achieve minfeerate requested.")
+                return self.bip78_error(request, "Bad request: we cannot "
+                                        "achieve minfeerate requested.",
+                                        "original-psbt-rejected")
 
         # Having checked the sender's conditions, we can apply the fee bump
         # intended (note the outputs will be shuffled next!):
@@ -884,8 +918,7 @@ class PayjoinServer(Resource):
         unsigned_payjoin_tx = btc.make_shuffled_tx(payjoin_tx_inputs, outs,
                                     version=payment_psbt.unsigned_tx.nVersion,
                                     locktime=payment_psbt.unsigned_tx.nLockTime)
-        log.debug("We created this unsigned tx: ")
-        log.debug(btc.human_readable_transaction(unsigned_payjoin_tx))
+
         # to create the PSBT we need the spent_outs for each input,
         # in the right order:
         spent_outs = []
@@ -893,6 +926,10 @@ class PayjoinServer(Resource):
             input_found = False
             for j, inp2 in enumerate(payment_psbt.unsigned_tx.vin):
                 if inp.prevout == inp2.prevout:
+                    # this belongs to sender.
+                    # respect sender's sequence number choice, even
+                    # if they were not uniform:
+                    inp.nSequence = inp2.nSequence
                     spent_outs.append(payment_psbt.inputs[j].utxo)
                     input_found = True
                     break
@@ -910,6 +947,16 @@ class PayjoinServer(Resource):
             # there should be no other inputs:
             assert input_found
 
+        # respect the sender's fixed sequence number, if it was used (we checked
+        # in the initial sanity check)
+        # TODO consider RBF if we implement it in Joinmarket payments.
+        if self.manager.fixed_sequence_number:
+            for inp in unsigned_payjoin_tx.vin:
+                inp.nSequence = self.manager.fixed_sequence_number
+
+        log.debug("We created this unsigned tx: ")
+        log.debug(btc.human_readable_transaction(unsigned_payjoin_tx))
+
         r_payjoin_psbt = self.wallet_service.create_psbt_from_tx(unsigned_payjoin_tx,
                                                       spent_outs=spent_outs)
         log.debug("Receiver created payjoin PSBT:\n{}".format(
@@ -924,6 +971,20 @@ class PayjoinServer(Resource):
 
         log.debug("Receiver signing successful. Payjoin PSBT is now:\n{}".format(
             self.wallet_service.human_readable_psbt(receiver_signed_psbt)))
+        # construct txoutset for the wallet service callback; we cannot use
+        # txid as we don't have all signatures.
+        txinfo = tuple((
+            x.scriptPubKey, x.nValue) for x in receiver_signed_psbt.unsigned_tx.vout)
+        self.wallet_service.register_callbacks([self.end_receipt],
+            txinfo =txinfo,
+            cb_type="unconfirmed")
         content = receiver_signed_psbt.to_base64()
         request.setHeader(b"content-length", ("%d" % len(content)).encode("ascii"))
         return content.encode("ascii")
+
+    def end_receipt(self, txd, txid):
+        log.info("transaction seen on network: " + txid)
+        process_shutdown()
+        # informs the wallet service transaction monitor
+        # that the transaction has been processed:
+        return True
