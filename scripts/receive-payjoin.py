@@ -132,6 +132,7 @@ def receive_payjoin_main():
     pj_server = PayjoinServer(wallet_service, options.mixdepth,
                     CCoinAddress(bip78_receiving_address), bip78_amount)
     site = Site(pj_server)
+    site.displayTracebacks = False
     jmprint("Attempting to start serving Tor HS on port: " + str(
         options.hsport) + " ...")
     start_tor(site, options.hsport)

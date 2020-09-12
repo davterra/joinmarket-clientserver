@@ -1,5 +1,5 @@
 from zope.interface import implementer
-from twisted.internet import reactor
+from twisted.internet import reactor, task
 from twisted.web.http import UNAUTHORIZED, BAD_REQUEST, NOT_FOUND
 from twisted.web.client import (Agent, readBody, ResponseFailed,
                                 BrowserLikePolicyForHTTPS)
@@ -645,7 +645,7 @@ def fallback_nonpayjoin_broadcast(err, manager):
         log.error("Unable to broadcast original payment. The payment is NOT made.")
         quit()
         return
-    log.info("We paid without coinjoin. Transaction: ")
+    log.info("Payment made without coinjoin. Transaction: ")
     log.info(btc.human_readable_transaction(original_tx))
     manager.set_broadcast(False)
     quit()
@@ -735,12 +735,26 @@ class PayjoinServer(Resource):
 
     def bip78_error(self, request, error_meaning,
                     error_code="unavailable", http_code=400):
-        # See https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#receivers-well-known-errors
-        # we return stringified json in the body.
+        """
+        See https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#receivers-well-known-errors
+
+        We return, to the sender, stringified json in the body as per the above.
+        In case the error code is "original-psbt-rejected", we do not have
+        any valid payment to broadcast, so we shut down with "not paid".
+        for other cases, we schedule the fallback for 60s from now.
+        """
+
         request.setResponseCode(http_code)
         request.setHeader(b"content-type", b"text/html; charset=utf-8")
         log.debug("Returning an error: " + str(
             error_code) + ": " + str(error_meaning))
+        if error_code in ["original-psbt-rejected", "version-unsupported"]:
+            log.warn("Payment is not valid. Payment has NOT been made.")
+            # shutdown now but wait until response is sent.
+            task.deferLater(reactor, 2.0, process_shutdown)
+        else:
+            reactor.callLater(60.0, fallback_nonpayjoin_broadcast,
+                              error_meaning.encode("utf-8"), self.manager)
         return json.dumps({"errorCode": error_code,
                            "message": error_meaning}).encode("utf-8")
 
