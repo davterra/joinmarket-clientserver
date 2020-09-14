@@ -21,7 +21,7 @@ bip78_amount = None
 bip78_receiving_address = None
 
 def setup_failed(arg):
-    log.error("SETUP FAILED", arg)
+    jlog.error("SETUP FAILED", arg)
     reactor.stop()
 
 def create_onion_ep(t, hs_public_port):

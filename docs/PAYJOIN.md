@@ -20,9 +20,15 @@ For that, see [this](https://joinmarket.me/blog/blog/payjoin/) post.
 
    b. [Using Joinmarket-wallet-to-Joinmarket-wallet payjoins](#jmtojm)
 
+   c. [About fees](#fees)
+
 5. [What if I wanted bech32 native segwit addresses?](#native)
 
-6. [Sample testnet wallet display output](#sample)
+6. [Receiving a BIP78 Payjoin payment](#receiving)
+
+7. [Configuring Tor to setup a hidden service](#torconfig)
+
+7. [Sample testnet wallet display output](#sample)
 
 Some instructions here will be redundant with the introductory [usage guide](USAGE.md); sections 1-3 are aimed at users who have not/ will not use Joinmarket for ordinary coinjoins.
 So just skip those sections if you already know it.
@@ -124,7 +130,7 @@ python wallet-tool.py wallet-name-you-chose.dat [display]
 
 ("display" is optional because default; use `python wallet-tool.py -h` to see all possible methods).
 
-Below is [an example](#sample-testnet-wallet-display-output) of what the wallet looks like (although
+Below is [an example](#sample) of what the wallet looks like (although
 yours will be mainnet, so the addresses will start with '3' not '2').
 
 Joinmarket by default uses *5* accounts, not only 1 as some other wallets (e.g. Electrum), this is to help
@@ -215,11 +221,9 @@ bump the fee enough to add one input to the transaction, and this should be fine
 
 This is now deprecated; if you still want to use it, use Joinmarket(-clientserver) version 0.7.0 or lower, and see the corresponding older version of this document.
 
-##### Controlling fees
+<a name="fees" />
 
-**The fees are paid by the sender of funds; note that the fees are going to be a bit higher than a normal payment** (typically
-about 2-3x higher); this may be changed to share the fee, in a future version. There are controls to make sure the fee
-isn't *too* high.
+##### About fees
 
 In the joinmarket.cfg file, under `[POLICY]` section you should see a setting called `tx_fees`.
 You can set this to any integer; if you set it to 1000 or less then it's treated as a "confirmation in N blocks target",
@@ -231,6 +235,10 @@ to use. **Don't use less than about 1200 if you do this** - a typical figure mig
 about 5-10 sats/byte, which nowadays is a reasonable fee. The exact amount is randomised by ~20% to avoid you inadvertently
 watermarking all your transactions. So don't use < 1200 because then you might be using less than 1 sat/byte which is
 difficult to relay on the Bitcoin network.
+
+BIP78 itself has various controls around fees - essentially it tries to let the receiver bump the fee but *only slightly* to account for the fact that the receiver is adding at least one more input and so increasing the size of the transaction, and also ensure that low fees do not accidentally fall too low (even, below the relay limit). Joinmarket's receiver will only add one input and never more, for now, and it looks like this is the tradeoff that most wallets will make. If you want to learn more investigate the `maxadditionalfeecontribution`, `additionalfeeoutputindex` and `minfeerate` parameters described in the BIP.
+
+As a spender in the BIP78 protocol, you will usually see the following: a small reduction in the size of your change output as a result of the extra 1 input. Unless the payment is very small, this probably won't be significant.
 
 <a name="native" />
 
@@ -257,6 +265,108 @@ the default (and the one used in Joinmarket itself).
 
 Note that the bech32 style wallet is written to conform to [BIP84](https://github.com/bitcoin/bips/blob/master/bip-0084.mediawiki),
 analogous to the BIP49 case for p2sh.
+
+<a name="receiving" />
+
+#### Receiving payments using BIP78 Payjoin
+
+Joinmarket allows you to receive payments from any wallet that supports spending via the BIP78 Protocol, using a Tor hidden service.
+
+This hidden service is "ephemeral" meaning it is set up specifically for the payment and discarded after you shut down the receiving process. The setup takes some few seconds but it isn't too slow.
+
+To make this work, you will need to do some minor configuring Tor, the first time. This is explained in detail [below](#torconfig). If you fail to do this step, you will see some rather unintelligible errors about connection failures when trying to run the script described next.
+
+Once that is ready, you can run the `receive-payjoin.py` script something like this:
+
+```python3
+(jmvenv)a$ python receive-payjoin.py -m1 walletname.jmdat 0.32
+```
+
+The arguments provided are the wallet name and the exact amount you intend to receive (here it's 0.32 BTC (flagged as BTC because decimal), but you could also write `32000000` which will be interpreted as satoshis).
+
+After a delay of 5-50 seconds (usually; Tor setup varies unpredictably), you will see a message like this:
+
+```
+Your hidden service is available. Please now pass this URI string to the sender to effect the payjoin payment:
+bitcoin:bc1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?amount=0.32000000&pj=http://fyrdc7dklhpify4g.onion:7083
+Keep this process running until the payment is received.
+```
+
+... which should be self explanatory. The sender may be using Joinmarket, or a different wallet that supports Payjoin, like Wasabi. As previously noted, Payjoins will not work if the address type in use by the two wallets is different, so for Wasabi it would be necessary to use a bech32 Joinmarket wallet (as was discussed [here](#native)).
+
+When the payment goes through you will see a chunk of logging text (most of which is serialized PSBTs being exchanged). If Payjoin was effected as intended, you will see:
+
+```
+date string [INFO] Removed utxos= ...
+date string [INFO] Added utxos= ...
+date string [INFO] transaction seen on network: hex-txid
+done
+```
+
+where hex-txid is of course the transaction id of the payjoin transaction which paid you.
+
+If you see:
+
+```
+date string [INFO] Payment made without coinjoin. Transaction:
+```
+
+followed by a detailed transaction output, it means that some incompatibility or error between the two wallets resulted in the normal non-payjoin (non-coinjoin) payment being sent; you still received your money, so DON'T ask to be paid again just because Payjoin failed! This is part of BIP78 - we recognize that things can go slightly wrong in the arrangement (for example, the wrong address type, or a fee requirement that cannot be met), so allowing normal payments instead is very much *intended behaviour*.
+
+On the other hand, if you see at the end:
+
+```
+2020-09-12 13:01:15,887 [WARNING]  Payment is not valid. Payment has NOT been made.
+```
+
+it means of course the other case. Double check with your counterparty, something more fundamental has gone wrong because they did not send you a valid non-coinjoin payment, as they were supposed to right at the start.
+
+<a name="torconfig" />
+
+#### Configuring Tor to setup a hidden service
+
+(These steps were prepared using Ubuntu; you may have to adjust for your distro).
+
+First, ensure you have Tor installed:
+
+```
+sudo apt install tor
+```
+
+Don't start the tor daemon yet though, since we need to do some setup. Edit Tor's config file with sudo:
+
+```
+sudo vim /etc/tor/torrc
+```
+
+and uncomment these two lines to enable hidden service startup:
+
+```
+ControlPort 9051
+CookieAuthentication 1
+```
+
+However if you proceed at this point to try to run `receive-payjoin.py` as outlined above, you will almost certainly get an error like this:
+
+```
+Permission denied: '/var/run/tor/control.authcookie'
+```
+
+... because reading this file requires being a member of the group `debian-tor`. So add your user to this group:
+
+```
+sudo usermod -a -G debian-tor yourusername
+```
+
+... and then you must *restart the computer/server* for that change to take effect (check it with `groups yourusername`).
+
+Finally, after system restart, ensure Tor is started (it may be automatically, but anyway):
+
+```
+sudo service tor start
+```
+
+ Once this is done, you should be able to run the BIP 78 receiver script and a hidden service will be automatically created for you from now on.
 
 <a name="sample" />
 
