@@ -15,6 +15,11 @@ from jmbase.support import EXIT_FAILURE, EXIT_ARGERROR
 from jmbitcoin import amount_to_sat, amount_to_btc, encode_bip21_uri, \
      CCoinAddress
 
+# txtorcon outputs erroneous warnings about hiddenservice directory strings,
+# annoyingly, so we suppress it here:
+import warnings
+warnings.filterwarnings("ignore")
+
 jlog = get_log()
 
 bip78_amount = None
@@ -133,7 +138,7 @@ def receive_payjoin_main():
                     CCoinAddress(bip78_receiving_address), bip78_amount)
     site = Site(pj_server)
     site.displayTracebacks = False
-    jmprint("Attempting to start serving Tor HS on port: " + str(
+    jmprint("Attempting to start onion service on port: " + str(
         options.hsport) + " ...")
     start_tor(site, options.hsport)
     reactor.run()
