@@ -288,7 +288,7 @@ After a delay of 5-50 seconds (usually; Tor setup varies unpredictably), you wil
 
 ```
 Your hidden service is available. Please now pass this URI string to the sender to effect the payjoin payment:
-bitcoin:bc1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?amount=0.32000000&pj=http://fyrdc7dklhpify4g.onion:7083
+bitcoin:bc1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?amount=0.32000000&pj=http://p53lf57qovyuvwsc6xnrppyply3vtqm7l6pcobkmyqsiofyeznfu5uqd.onion:7083
 Keep this process running until the payment is received.
 ```
 
